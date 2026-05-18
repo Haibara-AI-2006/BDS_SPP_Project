@@ -223,14 +223,17 @@ class AiCompensator:
     #  标签提取 (ECEF 误差)
     # ================================================================
     @staticmethod
-    def extract_labels(solutions: List) -> pd.DataFrame:
+    def extract_labels(solutions: List,
+                       truth_lookup: Optional[dict] = None) -> pd.DataFrame:
         """
         计算 ECEF 误差标签 (dX, dY, dZ)
 
-        Y = SPP_ECEF - GT_ECEF
+        Y = SPP_ECEF - GT_ECEF (truth_lookup 提供时使用动态真值)
 
         Parameters:
-            solutions : List[EpochSolution]
+            solutions    : List[EpochSolution]
+            truth_lookup : (可选) Dict[datetime, np.ndarray], 动态真值字典
+                           None 时回退到全局静态锚点 GT_ECEF
 
         Returns:
             DataFrame (n_epochs, 3) — ['dX', 'dY', 'dZ']
@@ -241,9 +244,23 @@ class AiCompensator:
             if not sol.valid:
                 continue
 
-            dx = sol.pos_ecef[0] - GT_ECEF[0]
-            dy = sol.pos_ecef[1] - GT_ECEF[1]
-            dz = sol.pos_ecef[2] - GT_ECEF[2]
+            # 选择真值: 优先 lookup, 否则锚点
+            if truth_lookup:
+                gt = truth_lookup.get(sol.epoch)
+                if gt is None:
+                    # 容差兜底
+                    for k, v in truth_lookup.items():
+                        if abs((k - sol.epoch).total_seconds()) < 0.5:
+                            gt = v
+                            break
+                if gt is None:
+                    gt = GT_ECEF
+            else:
+                gt = GT_ECEF
+
+            dx = sol.pos_ecef[0] - gt[0]
+            dy = sol.pos_ecef[1] - gt[1]
+            dz = sol.pos_ecef[2] - gt[2]
 
             labels.append([dx, dy, dz])
 

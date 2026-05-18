@@ -160,6 +160,69 @@ class ColoredMultipathGenerator:
 
         return eps_t
 
+# ============================================================
+#  椭圆轨迹生成器 — 用于动态轨迹真值
+# ============================================================
+class TrajectoryGenerator:
+    """
+    椭圆运动轨迹真值生成器
+    
+    轨迹参数化 (在以 GT_ECEF 为原点的 ENU 坐标系下):
+        E(t) = a · cos(2π·t/T)
+        N(t) = b · sin(2π·t/T)
+        U(t) = 0  (高度恒定)
+    
+    再通过 ENU→ECEF 旋转 (R_ENU.T) + 锚点平移得到 ECEF 真值坐标。
+    
+    Parameters:
+        a           : 椭圆长半轴 (m), 默认 500
+        b           : 椭圆短半轴 (m), 默认 300
+        period_sec  : 周期 (秒), 默认 3600 (1小时一圈)
+        height      : 椭球高 (m), 默认 35.0 (与锚点一致)
+        center_ecef : 中心 ECEF, 默认全局 GT_ECEF
+        R_enu       : ECEF→ENU 旋转矩阵, 默认全局 GT_R_ENU
+    """
+
+    def __init__(
+        self,
+        a: float = 500.0,
+        b: float = 300.0,
+        period_sec: float = 3600.0,
+        height: float = 35.0,
+        center_ecef: Optional[np.ndarray] = None,
+        R_enu: Optional[np.ndarray] = None,
+    ):
+        self.a = float(a)
+        self.b = float(b)
+        self.period = float(period_sec)
+        self.height = float(height)
+        self.omega = 2.0 * math.pi / self.period
+
+        # 默认使用全局真值锚点
+        self.center_ecef = (center_ecef.copy() if center_ecef is not None
+                            else GT_ECEF.copy())
+        self.R_enu = (R_enu.copy() if R_enu is not None
+                      else GT_R_ENU.copy())
+        # ENU → ECEF 旋转矩阵 (R 正交, 转置 = 逆)
+        self.R_enu_T = self.R_enu.T
+
+    def get_enu_at(self, t_sec: float) -> np.ndarray:
+        """获取相对于中心的 ENU 坐标 (m)"""
+        theta = self.omega * t_sec
+        e = self.a * math.cos(theta)
+        n = self.b * math.sin(theta)
+        u = 0.0  # 高度恒定 (相对锚点)
+        return np.array([e, n, u], dtype=np.float64)
+
+    def get_ecef_at(self, t_sec: float) -> np.ndarray:
+        """获取该时刻的 ECEF 真值坐标 (m)"""
+        enu = self.get_enu_at(t_sec)
+        return self.center_ecef + self.R_enu_T @ enu
+
+    def get_blh_at(self, t_sec: float) -> Tuple[float, float, float]:
+        """获取该时刻的大地坐标 (lat_rad, lon_rad, h_m)"""
+        ecef = self.get_ecef_at(t_sec)
+        return ecef_to_blh(ecef[0], ecef[1], ecef[2])
 
 # ============================================================
 #  场景配置
@@ -503,7 +566,259 @@ class DataSimulator:
             results[scene.name] = csv_path
 
         return results
+    # ================================================================
+    #  动态轨迹模式 — 生成轨迹OBS + 真值CSV
+    # ================================================================
+    def generate_trajectory_obs_file(
+        self,
+        start_time: datetime,
+        trajectory_gen: 'TrajectoryGenerator',
+        duration_hours: float = 24.0,
+        interval_sec: float = 30.0,
+        scene: SceneConfig = SCENE_OPEN_SKY,
+        obs_filename: Optional[str] = None,
+        csv_filename: Optional[str] = None,
+        truth_filename: Optional[str] = None,
+    ) -> Tuple[str, str, str]:
+        """
+        生成动态轨迹场景下的 RINEX OBS + 观测CSV + 真值轨迹CSV
 
+        与 generate_obs_file 的差异:
+          - 接收机位置随 trajectory_gen 动态变化
+          - 同步输出真值轨迹 CSV (供 TrajectoryAnalyzer 加载)
+
+        Returns:
+            (obs_path, csv_path, truth_path)
+        """
+        date_str = start_time.strftime("%Y%m%d")
+        if obs_filename is None:
+            obs_filename = f"BUPT_Traj_{date_str}_{scene.name}.obs"
+        if csv_filename is None:
+            csv_filename = f"{scene.name}_trajectory.csv"
+        if truth_filename is None:
+            truth_filename = f"{scene.name}_truth_trajectory.csv"
+
+        obs_path = os.path.join(self.output_dir, obs_filename)
+        csv_path = os.path.join(self.output_dir, csv_filename)
+        truth_path = os.path.join(self.output_dir, truth_filename)
+
+        print(f"\n[Simulator-Traj] 场景: {scene.label}")
+        print(f"[Simulator-Traj] 椭圆: a={trajectory_gen.a}m, "
+              f"b={trajectory_gen.b}m, T={trajectory_gen.period}s")
+        print(f"[Simulator-Traj] 时间范围: {start_time} → "
+              f"{start_time + timedelta(hours=duration_hours)}")
+        print(f"[Simulator-Traj] 采样间隔: {interval_sec}s")
+
+        # 重置多径生成器
+        self.multipath_gen = ColoredMultipathGenerator(
+            alpha=scene.multipath_alpha,
+            base_amplitude=scene.multipath_amplitude,
+        )
+
+        n_epochs = int(duration_hours * 3600 / interval_sec)
+        epoch_records = []
+        obs_blocks = []
+        truth_records = []
+
+        rclk_base = 60.0  # 接收机钟差基准 (m)
+
+        for ep_idx in range(n_epochs):
+            current_time = start_time + timedelta(seconds=ep_idx * interval_sec)
+            tau = ep_idx * interval_sec
+            _, tow = gps_week_seconds_from_datetime(current_time)
+
+            # === 当前历元的真实接收机位置 (动态) ===
+            rx_ecef_now = trajectory_gen.get_ecef_at(tau)
+            rx_lat_rad, rx_lon_rad, rx_h = ecef_to_blh(
+                rx_ecef_now[0], rx_ecef_now[1], rx_ecef_now[2]
+            )
+            enu_truth = trajectory_gen.get_enu_at(tau)
+
+            # === 记录真值 ===
+            truth_records.append({
+                'epoch': current_time.strftime("%Y-%m-%d %H:%M:%S"),
+                'epoch_idx': ep_idx,
+                'gt_x': rx_ecef_now[0],
+                'gt_y': rx_ecef_now[1],
+                'gt_z': rx_ecef_now[2],
+                'gt_lat_deg': math.degrees(rx_lat_rad),
+                'gt_lon_deg': math.degrees(rx_lon_rad),
+                'gt_height': rx_h,
+                'gt_e': enu_truth[0],
+                'gt_n': enu_truth[1],
+                'gt_u': enu_truth[2],
+            })
+
+            rclk_noise = rclk_base + random.gauss(0, 12.0)
+            epoch_sats = {}
+
+            for prn, eph_list in self.nav_parser.ephemeris_pool.items():
+                eph = self.nav_parser.select_ephemeris(prn, current_time)
+                if eph is None:
+                    continue
+
+                # 严密光行时双重迭代 (与静态版本一致)
+                res_rough = self.sat_calc.compute_sat_pos_clk(prn, current_time, 0.0)
+                if res_rough is None:
+                    continue
+                sv_pos_rough, _ = res_rough
+
+                pr_true = np.linalg.norm(sv_pos_rough - rx_ecef_now)
+
+                result = self.sat_calc.compute_sat_pos_clk(
+                    prn, current_time, pr_true
+                )
+                if result is None:
+                    continue
+                sv_pos, sv_clk_sec = result
+
+                if np.linalg.norm(sv_pos) < 1e6:
+                    continue
+
+                # 高度角与方位角 (基于动态接收机位置)
+                elev, az = compute_elevation_azimuth(rx_ecef_now, sv_pos)
+                elev_deg = math.degrees(elev)
+
+                if elev_deg < scene.elev_mask_deg:
+                    continue
+
+                if random.random() < scene.random_sv_dropout:
+                    continue
+
+                # === Sagnac 修正 ===
+                tau_prop = np.linalg.norm(sv_pos - rx_ecef_now) / SPEED_OF_LIGHT
+                theta = OMEGA_E_BDS * tau_prop
+                cos_t = math.cos(theta)
+                sin_t = math.sin(theta)
+                R_sagnac = np.array([
+                    [ cos_t, sin_t, 0.0],
+                    [-sin_t, cos_t, 0.0],
+                    [  0.0,   0.0,  1.0],
+                ])
+                sv_pos_rot = R_sagnac @ sv_pos
+                rho_geo = np.linalg.norm(sv_pos_rot - rx_ecef_now)
+
+                # === 噪声注入 (与静态版本一致) ===
+                err_sisre = random.gauss(0, 0.5)
+
+                iono_nominal = self.sat_calc.klobuchar_bds(
+                    rx_lat_rad, rx_lon_rad, elev, az, tow
+                )
+                err_iono = (iono_nominal + random.gauss(0, 0.5)) * scene.iono_scale
+
+                tropo_nominal = self.sat_calc.saastamoinen(elev, rx_lat_rad, rx_h)
+                err_tropo = (tropo_nominal + random.gauss(0, 0.3)) * scene.tropo_scale
+
+                err_rclk = rclk_noise
+                err_obs = random.gauss(0, 0.3)
+
+                err_multipath = 0.0
+                if scene.multipath_enabled and elev_deg < scene.multipath_elev_threshold_deg:
+                    err_multipath = self.multipath_gen.generate(prn, elev)
+
+                # 合成伪距
+                c_dt_sv = SPEED_OF_LIGHT * sv_clk_sec
+                pseudorange = (rho_geo - c_dt_sv + err_sisre + err_iono
+                               + err_tropo + err_rclk + err_obs + err_multipath)
+
+                # SNR
+                snr_base = 25.0 + 20.0 * math.sin(elev)
+                if scene.multipath_enabled and elev_deg < scene.multipath_elev_threshold_deg:
+                    snr_base -= abs(err_multipath) * 0.8
+                snr = max(snr_base + random.gauss(0, 2.0), 10.0)
+
+                epoch_sats[prn] = {
+                    'pseudorange': pseudorange,
+                    'snr': snr,
+                    'elev_deg': elev_deg,
+                    'az_deg': math.degrees(az),
+                    'rho_geo': rho_geo,
+                    'err_sisre': err_sisre,
+                    'err_iono': err_iono,
+                    'err_tropo': err_tropo,
+                    'err_rclk': err_rclk,
+                    'err_obs': err_obs,
+                    'err_multipath': err_multipath,
+                    'sv_pos': sv_pos.copy(),
+                }
+
+            if len(epoch_sats) >= 4:
+                obs_blocks.append((current_time, epoch_sats))
+                for prn, sdata in epoch_sats.items():
+                    epoch_records.append({
+                        'epoch': current_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        'epoch_idx': ep_idx,
+                        'prn': prn,
+                        'pseudorange': sdata['pseudorange'],
+                        'snr': sdata['snr'],
+                        'elev_deg': sdata['elev_deg'],
+                        'az_deg': sdata['az_deg'],
+                        'rho_geo': sdata['rho_geo'],
+                        'err_total': (sdata['err_sisre'] + sdata['err_iono']
+                                      + sdata['err_tropo'] + sdata['err_rclk']
+                                      + sdata['err_obs'] + sdata['err_multipath']),
+                        'err_multipath': sdata['err_multipath'],
+                        'n_sats': len(epoch_sats),
+                        'scene': scene.name,
+                        'gt_x': rx_ecef_now[0],
+                        'gt_y': rx_ecef_now[1],
+                        'gt_z': rx_ecef_now[2],
+                    })
+
+        print(f"[Simulator-Traj] 共生成 {len(obs_blocks)} 个有效历元")
+
+        # 写 OBS 文件 (RINEX 头里的 APPROX POSITION 仍用锚点 GT_ECEF, 因为它仅是先验)
+        self._write_rinex_obs(obs_path, obs_blocks, start_time, interval_sec)
+
+        # 观测 CSV
+        pd.DataFrame(epoch_records).to_csv(csv_path, index=False,
+                                            float_format='%.6f')
+        # 真值轨迹 CSV
+        pd.DataFrame(truth_records).to_csv(truth_path, index=False,
+                                            float_format='%.6f')
+
+        print(f"[Simulator-Traj] OBS:   {obs_path}")
+        print(f"[Simulator-Traj] CSV:   {csv_path}")
+        print(f"[Simulator-Traj] TRUTH: {truth_path}")
+
+        return obs_path, csv_path, truth_path
+
+    def generate_all_scenes_trajectory(
+        self,
+        start_time: datetime,
+        trajectory_gen: 'TrajectoryGenerator',
+        duration_hours: float = 24.0,
+        interval_sec: float = 30.0,
+    ) -> Dict[str, Tuple[str, str, str]]:
+        """
+        批量生成三大场景的轨迹数据
+
+        Returns:
+            {scene_name: (obs_path, csv_path, truth_path)}
+        """
+        results = {}
+        scenes = [SCENE_OPEN_SKY, SCENE_TREE_CANOPY, SCENE_URBAN_CANYON]
+        date_str = start_time.strftime("%Y%m%d")
+
+        for scene in scenes:
+            obs_fn = f"BUPT_Traj_{date_str}_{scene.name}.obs"
+            csv_fn = f"{scene.name}_trajectory.csv"
+            truth_fn = f"{scene.name}_truth_trajectory.csv"
+
+            paths = self.generate_trajectory_obs_file(
+                start_time=start_time,
+                trajectory_gen=trajectory_gen,
+                duration_hours=duration_hours,
+                interval_sec=interval_sec,
+                scene=scene,
+                obs_filename=obs_fn,
+                csv_filename=csv_fn,
+                truth_filename=truth_fn,
+            )
+            results[scene.name] = paths
+
+        return results
+    
     # ================================================================
     #  RINEX 3.x OBS 文件写入
     # ================================================================
@@ -573,6 +888,9 @@ class DataSimulator:
 # ============================================================
 #  独立运行入口
 # ============================================================
+# ============================================================
+#  独立运行入口
+# ============================================================
 if __name__ == "__main__":
     import sys
 
@@ -582,18 +900,32 @@ if __name__ == "__main__":
         sys.exit(1)
 
     simulator = DataSimulator(nav_file, output_dir="data")
-
-    # 起始时间: 2026-05-10 00:00:00 BDT
     start = datetime(2026, 5, 10, 0, 0, 0)
 
-    # 生成三大场景 (24 小时, 30 秒采样)
-    scene_paths = simulator.generate_all_scenes(
+    # ---- 静态三场景 ----
+    print("\n" + "=" * 60)
+    print(" 静态三场景生成")
+    print("=" * 60)
+    static_paths = simulator.generate_all_scenes(
+        start_time=start, duration_hours=24.0, interval_sec=30.0,
+    )
+    for name, path in static_paths.items():
+        print(f"  {name}: {path}")
+
+    # ---- 动态轨迹三场景 ----
+    print("\n" + "=" * 60)
+    print(" 动态轨迹三场景生成 (椭圆: a=500m, b=300m, T=3600s)")
+    print("=" * 60)
+    traj_gen = TrajectoryGenerator(a=500.0, b=300.0, period_sec=3600.0)
+    traj_paths = simulator.generate_all_scenes_trajectory(
         start_time=start,
+        trajectory_gen=traj_gen,
         duration_hours=24.0,
         interval_sec=30.0,
     )
-
-    for name, path in scene_paths.items():
-        print(f"  {name}: {path}")
+    for name, (obs_p, csv_p, truth_p) in traj_paths.items():
+        print(f"  {name}:")
+        print(f"    OBS:   {obs_p}")
+        print(f"    TRUTH: {truth_p}")
 
     print("\n[Simulator] 全部场景数据生成完毕!")

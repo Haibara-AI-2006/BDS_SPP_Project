@@ -77,6 +77,28 @@ def _ecef_to_enu_matrix(lat_rad: float, lon_rad: float) -> np.ndarray:
 GT_ECEF = _blh_to_ecef(GT_LAT_RAD, GT_LON_RAD, GT_HEIGHT)
 R_ENU = _ecef_to_enu_matrix(GT_LAT_RAD, GT_LON_RAD)
 
+# ============================================================
+#  真值轨迹 CSV 加载工具
+# ============================================================
+def load_truth_trajectory_csv(csv_path: str) -> pd.DataFrame:
+    """
+    从 CSV 加载真值轨迹
+
+    要求 CSV 至少包含列: epoch, gt_x, gt_y, gt_z
+
+    Returns:
+        DataFrame, 'epoch' 列已转换为 datetime
+    """
+    df = pd.read_csv(csv_path)
+
+    required = {'epoch', 'gt_x', 'gt_y', 'gt_z'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"真值CSV缺失列: {missing}")
+
+    df['epoch'] = pd.to_datetime(df['epoch'])
+    print(f"[TruthLoader] 加载真值轨迹: {csv_path}, {len(df)} 个历元")
+    return df
 
 # ============================================================
 #  轨迹分析器
@@ -97,16 +119,70 @@ class TrajectoryAnalyzer:
         solutions: Optional[List] = None,
         output_dir: str = 'data',
         scene_label: str = '开阔天空',
+        truth_mode: str = 'static',
+        truth_trajectory: Optional[pd.DataFrame] = None,
     ):
+        """
+        Parameters:
+            solutions       : EpochSolution 列表
+            output_dir      : 图表/CSV 输出目录
+            scene_label     : 场景标签 (用于图表标题)
+            truth_mode      : 'static' (单点真值锚点) 或 'trajectory' (动态真值轨迹)
+            truth_trajectory: trajectory 模式下的真值 DataFrame, 必须包含
+                              ['epoch', 'gt_x', 'gt_y', 'gt_z']
+        """
         self.solutions = solutions or []
         self.output_dir = output_dir
         self.scene_label = scene_label
         os.makedirs(output_dir, exist_ok=True)
 
+        # 真值模式
+        if truth_mode not in ('static', 'trajectory'):
+            raise ValueError(f"truth_mode 必须是 'static' 或 'trajectory', 收到: {truth_mode}")
+        self.truth_mode = truth_mode
+        self.truth_trajectory = truth_trajectory
+
+        if truth_mode == 'trajectory':
+            if truth_trajectory is None or len(truth_trajectory) == 0:
+                raise ValueError("trajectory 模式必须提供 truth_trajectory DataFrame")
+            self._truth_lookup = self._build_truth_lookup(truth_trajectory)
+            print(f"[Analyzer] 真值模式: trajectory ({len(self._truth_lookup)} 个真值历元)")
+        else:
+            self._truth_lookup = None
+            print(f"[Analyzer] 真值模式: static (锚点 = 北邮沙河)")
+
         # 分析结果缓存
         self.df: Optional[pd.DataFrame] = None
         self.enu_errors: Optional[np.ndarray] = None
 
+    @staticmethod
+    def _build_truth_lookup(truth_df: pd.DataFrame) -> Dict[datetime, np.ndarray]:
+        """构建 epoch → ECEF 真值字典 (用 pd.Timestamp 作 key)"""
+        lookup = {}
+        epochs = pd.to_datetime(truth_df['epoch'])
+        for ep, x, y, z in zip(epochs, truth_df['gt_x'],
+                                truth_df['gt_y'], truth_df['gt_z']):
+            # 转为 datetime (与 EpochSolution.epoch 保持一致)
+            key = ep.to_pydatetime() if hasattr(ep, 'to_pydatetime') else ep
+            lookup[key] = np.array([x, y, z], dtype=np.float64)
+        return lookup
+
+    def _get_gt_ecef(self, sol_epoch: datetime) -> Optional[np.ndarray]:
+        """根据真值模式返回该历元的 ECEF 真值, 找不到返回 None"""
+        if self.truth_mode == 'static':
+            return GT_ECEF
+        # trajectory 模式: 字典查找
+        gt = self._truth_lookup.get(sol_epoch)
+        if gt is not None:
+            return gt
+        # 兜底: 容差匹配 (秒级误差)
+        for k, v in self._truth_lookup.items():
+            if abs((k - sol_epoch).total_seconds()) < 0.5:
+                return v
+        return None
+    # ================================================================
+    #  从 solutions 列表构建 DataFrame
+    # ================================================================
     # ================================================================
     #  从 solutions 列表构建 DataFrame
     # ================================================================
@@ -114,25 +190,32 @@ class TrajectoryAnalyzer:
         """
         从 EpochSolution 列表中提取数据并计算 ENU 误差
 
-        Returns:
-            包含所有分析数据的 DataFrame
+        - static 模式: 误差 = pos - GT_ECEF (锚点)
+        - trajectory 模式: 误差 = pos - truth_lookup[epoch] (动态真值)
+
+        ENU 旋转矩阵统一使用锚点 R_ENU (轨迹尺度 << 地球曲率, 误差可忽略)
         """
         records = []
         enu_list = []
+        n_skipped = 0
 
         for sol in self.solutions:
             if not sol.valid:
                 continue
 
+            # 获取该历元的真值
+            gt_ecef = self._get_gt_ecef(sol.epoch)
+            if gt_ecef is None:
+                n_skipped += 1
+                continue
+
             # ECEF 误差
-            dx_ecef = sol.pos_ecef - GT_ECEF
-            # 转 ENU
+            dx_ecef = sol.pos_ecef - gt_ecef
+            # 转 ENU (统一用锚点旋转矩阵)
             enu = R_ENU @ dx_ecef
             enu_list.append(enu)
 
-            # 3D 误差
             err_3d = np.linalg.norm(dx_ecef)
-            # 水平误差
             err_h = math.sqrt(enu[0] ** 2 + enu[1] ** 2)
 
             records.append({
@@ -140,6 +223,9 @@ class TrajectoryAnalyzer:
                 'x_ecef': sol.pos_ecef[0],
                 'y_ecef': sol.pos_ecef[1],
                 'z_ecef': sol.pos_ecef[2],
+                'gt_x': gt_ecef[0],
+                'gt_y': gt_ecef[1],
+                'gt_z': gt_ecef[2],
                 'lat_deg': sol.lat_deg,
                 'lon_deg': sol.lon_deg,
                 'height': sol.height,
@@ -161,9 +247,10 @@ class TrajectoryAnalyzer:
         self.df = pd.DataFrame(records)
         self.enu_errors = np.array(enu_list) if enu_list else np.empty((0, 3))
 
-        print(f"[Analyzer] 有效历元: {len(self.df)}")
+        print(f"[Analyzer] 有效历元: {len(self.df)}  "
+              f"(模式={self.truth_mode}, 跳过={n_skipped})")
         return self.df
-
+    
     # ================================================================
     #  从外部 DataFrame 加载 (统一接口)
     # ================================================================
@@ -256,12 +343,7 @@ class TrajectoryAnalyzer:
     #  一键绘制全部图表
     # ================================================================
     def plot_all(self, prefix: str = '') -> List[str]:
-        """
-        绘制满分图表全家桶
-
-        Returns:
-            生成的图片文件路径列表
-        """
+        """绘制满分图表全家桶 (轨迹模式下追加轨迹对比图)"""
         if self.df is None or len(self.df) == 0:
             print("[Analyzer] 无数据可绘制")
             return []
@@ -274,6 +356,10 @@ class TrajectoryAnalyzer:
         paths.append(self.plot_dop_timeseries(tag))
         paths.append(self.plot_satellite_count(tag))
         paths.append(self.plot_3d_error_timeseries(tag))
+
+        # 轨迹模式下追加
+        if self.truth_mode == 'trajectory':
+            paths.append(self.plot_trajectory_vs_truth(tag))
 
         return [p for p in paths if p]
 
@@ -480,6 +566,117 @@ class TrajectoryAnalyzer:
         print(f"[Analyzer] 3D 误差图: {path}")
         return path
 
+
+    # ================================================================
+    #  轨迹模式专属: 真值轨迹 vs 解算轨迹对比图
+    # ================================================================
+    def plot_trajectory_vs_truth(
+        self,
+        tag: str = '',
+        solutions_compensated: Optional[List] = None,
+    ) -> str:
+        """
+        绘制真值轨迹与 SPP 解算轨迹的 ENU 平面对比图
+
+        仅在 truth_mode='trajectory' 下有意义。
+
+        Parameters:
+            tag                  : 图表标签
+            solutions_compensated: 可选, AI 补偿后结果, 一并叠加显示
+
+        Returns:
+            生成的图片路径
+        """
+        if self.truth_mode != 'trajectory':
+            print("[Analyzer] plot_trajectory_vs_truth 仅支持 trajectory 模式")
+            return ''
+        if self.df is None or len(self.df) == 0:
+            return ''
+
+        df = self.df
+
+        # === 真值 ENU (相对锚点) ===
+        gt_xyz = df[['gt_x', 'gt_y', 'gt_z']].values
+        gt_dx = gt_xyz - GT_ECEF[np.newaxis, :]
+        gt_enu = (R_ENU @ gt_dx.T).T   # (n, 3)
+
+        # === SPP 解算 ENU (相对锚点) ===
+        sol_xyz = df[['x_ecef', 'y_ecef', 'z_ecef']].values
+        sol_dx = sol_xyz - GT_ECEF[np.newaxis, :]
+        sol_enu = (R_ENU @ sol_dx.T).T
+
+        # === 补偿后 ENU (可选) ===
+        comp_enu = None
+        if solutions_compensated:
+            comp_xyz = []
+            for sc in solutions_compensated:
+                if sc.valid:
+                    comp_xyz.append(sc.pos_ecef)
+            if comp_xyz:
+                comp_xyz = np.array(comp_xyz)
+                comp_dx = comp_xyz - GT_ECEF[np.newaxis, :]
+                comp_enu = (R_ENU @ comp_dx.T).T
+
+        # === 绘图: 双子图 (左 ENU 平面, 右 沿轨迹 3D 误差时序) ===
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+        fig.suptitle(f'真值轨迹 vs SPP 解算轨迹 — {tag}',
+                     fontsize=14, fontweight='bold')
+
+        # --- 左图: ENU 平面图 ---
+        ax1.plot(gt_enu[:, 0], gt_enu[:, 1],
+                 color='#2ca02c', linewidth=2.0, linestyle='--',
+                 label='真值轨迹', zorder=2)
+        ax1.scatter(sol_enu[:, 0], sol_enu[:, 1],
+                    c='#d62728', s=8, alpha=0.6,
+                    label='SPP 解算', zorder=3)
+
+        if comp_enu is not None:
+            ax1.scatter(comp_enu[:, 0], comp_enu[:, 1],
+                        c='#1f77b4', s=8, alpha=0.6,
+                        label='AI 补偿后', zorder=4)
+
+        # 起点终点标记
+        ax1.scatter(gt_enu[0, 0], gt_enu[0, 1],
+                    c='black', s=100, marker='^',
+                    label='起点', zorder=5)
+        ax1.scatter(gt_enu[-1, 0], gt_enu[-1, 1],
+                    c='black', s=100, marker='v',
+                    label='终点', zorder=5)
+
+        ax1.axhline(0, color='gray', linewidth=0.5, alpha=0.4)
+        ax1.axvline(0, color='gray', linewidth=0.5, alpha=0.4)
+        ax1.set_xlabel('East (m)', fontsize=11)
+        ax1.set_ylabel('North (m)', fontsize=11)
+        ax1.set_title('ENU 平面轨迹对比', fontsize=12)
+        ax1.legend(loc='best', fontsize=9)
+        ax1.grid(True, alpha=0.3)
+        ax1.axis('equal')
+
+        # --- 右图: 沿轨迹的 3D 误差时序 ---
+        ax2.plot(df['epoch'], df['err_3d'],
+                 color='#d62728', linewidth=0.8, alpha=0.8,
+                 label=f"SPP RMS={np.sqrt(np.mean(df['err_3d']**2)):.2f}m")
+
+        if comp_enu is not None:
+            comp_err_3d = np.linalg.norm(comp_enu - gt_enu[:len(comp_enu)], axis=1)
+            ax2.plot(df['epoch'][:len(comp_err_3d)], comp_err_3d,
+                     color='#1f77b4', linewidth=0.8, alpha=0.8,
+                     label=f"补偿后 RMS={np.sqrt(np.mean(comp_err_3d**2)):.2f}m")
+
+        ax2.set_xlabel('时间 (UTC)', fontsize=11)
+        ax2.set_ylabel('沿轨迹 3D 误差 (m)', fontsize=11)
+        ax2.set_title('轨迹定位误差时序', fontsize=12)
+        ax2.legend(loc='upper right', fontsize=9)
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim(bottom=0)
+        fig.autofmt_xdate(rotation=30)
+
+        plt.tight_layout()
+        path = os.path.join(self.output_dir, f'{tag}_trajectory_vs_truth.png')
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"[Analyzer] 轨迹对比图: {path}")
+        return path
     # ================================================================
     #  AI 补偿前后对比图 (对接 ai_compensator)
     # ================================================================

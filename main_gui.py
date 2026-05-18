@@ -94,7 +94,7 @@ MAX_BUFFER = 2880  # 24h × 30s = 2880 个历元
 #  SppWorker — QThread 后台解算工作线程
 # ============================================================
 class SppWorker(QThread):
-    """后台 SPP 解算工作线程"""
+    """后台 SPP 解算工作线程 (支持静态/轨迹双模式真值)"""
 
     progress_signal = pyqtSignal(dict)
     finished_signal = pyqtSignal(list)
@@ -106,6 +106,8 @@ class SppWorker(QThread):
         obs_path: str,
         elev_mask: float = 5.0,
         max_iter: int = 20,
+        truth_mode: str = 'static',
+        truth_lookup: Optional[dict] = None,  # Dict[datetime, np.ndarray]
         parent=None,
     ):
         super().__init__(parent)
@@ -113,44 +115,47 @@ class SppWorker(QThread):
         self.obs_path = obs_path
         self.elev_mask = elev_mask
         self.max_iter = max_iter
+        self.truth_mode = truth_mode
+        self.truth_lookup = truth_lookup or {}
         self._is_cancelled = False
 
     def cancel(self):
-        """请求取消解算"""
         self._is_cancelled = True
 
-    def run(self):
-        """工作线程主函数"""
-        solutions = []  # 在最开始定义
-        total = 0       # 在最开始定义
+    def _get_gt_ecef_for_epoch(self, epoch):
+        """根据真值模式返回该历元的 ECEF 真值"""
+        if self.truth_mode == 'static':
+            return GT_ECEF
+        gt = self.truth_lookup.get(epoch)
+        if gt is not None:
+            return gt
+        # 容差兜底
+        for k, v in self.truth_lookup.items():
+            if abs((k - epoch).total_seconds()) < 0.5:
+                return v
+        return None
 
+    def run(self):
+        solutions = []
+        total = 0
         try:
-            # --- 解析 NAV ---
             nav_parser = RinexNavParser()
             nav_parser.parse(self.nav_path)
-
-            # --- 解析 OBS ---
             obs_parser = RinexObsParser()
             obs_parser.parse(self.obs_path)
 
-            # --- 构建计算器 ---
             sat_calc = SatPosCalculator(nav_parser)
-
-            # --- 构建解算器 ---
             solver = SppSolver(
                 nav_parser, obs_parser, sat_calc,
                 elevation_mask=self.elev_mask,
             )
 
-            # --- 真值 ECEF (使用全局常量) ---
-            gt_ecef = GT_ECEF.copy()
             r_enu = R_ENU.copy()
 
             total = len(obs_parser.epochs)
             state = np.zeros(4)
             state[:3] = obs_parser.approx_pos.copy()
 
-            # 逐历元解算
             for idx, epoch_obs in enumerate(obs_parser.epochs):
                 if self._is_cancelled:
                     break
@@ -164,7 +169,14 @@ class SppWorker(QThread):
                     solver._last_valid_state = state.copy()
                     solver._has_last_valid = True
 
-                # 构建进度信号字典
+                # 当前历元真值
+                gt_ecef = self._get_gt_ecef_for_epoch(epoch_obs.epoch)
+                if gt_ecef is None:
+                    gt_ecef = GT_ECEF  # 兜底
+
+                # 真值 ENU (相对锚点, 用于 GUI 轨迹绘制)
+                gt_enu = r_enu @ (gt_ecef - GT_ECEF)
+
                 sig = {
                     'epoch_idx': idx,
                     'total': total,
@@ -172,18 +184,31 @@ class SppWorker(QThread):
                     'n_used': sol.n_used,
                     'n_excluded': 0,
                     'pdop': sol.dop.pdop if sol.valid else 99.9,
-                    'enu': (0.0, 0.0, 0.0),
+                    'enu': (0.0, 0.0, 0.0),       # 误差 ENU (相对当前历元真值)
+                    'sol_enu_anchor': (0.0, 0.0, 0.0),  # 解算 ENU (相对锚点)
+                    'gt_enu_anchor': (float(gt_enu[0]),
+                                       float(gt_enu[1]),
+                                       float(gt_enu[2])),
                     'skyplot': [],
                     'lat_deg': sol.lat_deg,
                     'lon_deg': sol.lon_deg,
                     'height': sol.height,
                     'epoch_str': epoch_obs.epoch.strftime('%H:%M:%S'),
+                    'truth_mode': self.truth_mode,
                 }
 
                 if sol.valid:
-                    dx = sol.pos_ecef - gt_ecef
-                    enu = r_enu @ dx
-                    sig['enu'] = (float(enu[0]), float(enu[1]), float(enu[2]))
+                    # 误差 ENU = 解算位置 - 当前真值
+                    err_enu = r_enu @ (sol.pos_ecef - gt_ecef)
+                    sig['enu'] = (float(err_enu[0]),
+                                  float(err_enu[1]),
+                                  float(err_enu[2]))
+
+                    # 解算位置相对锚点的 ENU (用于轨迹画布)
+                    sol_enu = r_enu @ (sol.pos_ecef - GT_ECEF)
+                    sig['sol_enu_anchor'] = (float(sol_enu[0]),
+                                              float(sol_enu[1]),
+                                              float(sol_enu[2]))
 
                     sky_data = []
                     for k, prn in enumerate(sol.prn_list):
@@ -192,17 +217,15 @@ class SppWorker(QThread):
                             el_d = math.degrees(sol.elevations[k])
                             sky_data.append((prn, az_d, el_d))
                     sig['skyplot'] = sky_data
-                    sig['n_excluded'] = max(0, len(epoch_obs.satellites) - sol.n_used)
+                    sig['n_excluded'] = max(0,
+                                            len(epoch_obs.satellites) - sol.n_used)
 
                 self.progress_signal.emit(sig)
 
             self.finished_signal.emit(solutions)
-
-        except Exception as exc:
+        except Exception:
             import traceback
-            error_msg = traceback.format_exc()
-            self.error_signal.emit(error_msg)
-
+            self.error_signal.emit(traceback.format_exc())
 
 # ============================================================
 #  实时绘图画布
@@ -321,7 +344,129 @@ class RealtimeCanvas(FigureCanvas):
         self.ax_sky.clear()
         self.draw_idle()
 
+# ============================================================
+#  TrajectoryCanvas — 实时轨迹平面图画布
+# ============================================================
+class TrajectoryCanvas(FigureCanvas):
+    """
+    实时轨迹监控画布 (ENU 平面图)
+    
+    组成:
+      - 真值轨迹: 蓝色虚线 (调用 set_truth_curve 一次性绘制)
+      - SPP 解算点: 红色散点 (实时追加)
+      - 当前点: 黄色高亮大点
+      - 补偿后点: 绿色散点 (compensate_solutions 后调用 set_compensated)
+    """
 
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(10, 8), dpi=100, constrained_layout=True)
+        super().__init__(self.fig)
+        self.setParent(parent)
+
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_xlabel('East (m)', fontsize=11)
+        self.ax.set_ylabel('North (m)', fontsize=11)
+        self.ax.set_title('轨迹监控 — ENU 平面图', fontsize=12, fontweight='bold')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.axhline(0, color='gray', linewidth=0.5, alpha=0.4)
+        self.ax.axvline(0, color='gray', linewidth=0.5, alpha=0.4)
+
+        # 真值曲线 (虚线)
+        self.line_truth, = self.ax.plot([], [], color='#2ca02c',
+                                         linewidth=2.0, linestyle='--',
+                                         label='真值轨迹', zorder=2)
+        # SPP 散点
+        self.scatter_solve = self.ax.scatter([], [], c='#d62728',
+                                              s=8, alpha=0.6,
+                                              label='SPP 解算', zorder=3)
+        # 当前点高亮
+        self.current_point, = self.ax.plot([], [], 'o',
+                                            color='gold', markersize=12,
+                                            markeredgecolor='black',
+                                            markeredgewidth=1.5,
+                                            label='当前点', zorder=10)
+        # 补偿后散点 (初始为空)
+        self.scatter_comp = self.ax.scatter([], [], c='#1f77b4',
+                                             s=8, alpha=0.6,
+                                             label='AI 补偿', zorder=4,
+                                             visible=False)
+
+        self.ax.legend(loc='upper right', fontsize=9)
+        self.ax.set_aspect('equal', adjustable='datalim')
+
+        # 数据缓冲
+        self.buf_e_solve = deque(maxlen=MAX_BUFFER)
+        self.buf_n_solve = deque(maxlen=MAX_BUFFER)
+        # 真值缓冲 (轨迹模式下逐历元接收;静态模式下为单点)
+        self.buf_e_truth = deque(maxlen=MAX_BUFFER)
+        self.buf_n_truth = deque(maxlen=MAX_BUFFER)
+
+    def set_truth_curve(self, e_arr, n_arr):
+        """
+        一次性设置真值轨迹曲线 (用于在解算开始前预绘制)
+
+        Parameters:
+            e_arr, n_arr : array-like, ENU 平面真值坐标
+        """
+        self.line_truth.set_data(np.asarray(e_arr), np.asarray(n_arr))
+        # 自动调整坐标范围
+        if len(e_arr) > 0:
+            margin = 50.0
+            self.ax.set_xlim(min(e_arr) - margin, max(e_arr) + margin)
+            self.ax.set_ylim(min(n_arr) - margin, max(n_arr) + margin)
+        self.draw_idle()
+
+    def update_point(self, epoch_idx: int, sol_e: float, sol_n: float,
+                     gt_e: Optional[float] = None,
+                     gt_n: Optional[float] = None):
+        """
+        追加一个新解算点 (并可选更新当前真值点)
+
+        Parameters:
+            epoch_idx : 历元索引
+            sol_e, sol_n : SPP 解算 ENU 坐标
+            gt_e, gt_n   : (可选) 当前历元真值 ENU 坐标
+        """
+        self.buf_e_solve.append(float(sol_e))
+        self.buf_n_solve.append(float(sol_n))
+
+        if gt_e is not None and gt_n is not None:
+            self.buf_e_truth.append(float(gt_e))
+            self.buf_n_truth.append(float(gt_n))
+
+        # 更新散点
+        pts = np.column_stack([list(self.buf_e_solve),
+                               list(self.buf_n_solve)])
+        self.scatter_solve.set_offsets(pts)
+
+        # 更新当前点高亮
+        self.current_point.set_data([sol_e], [sol_n])
+
+        # 每 5 个历元刷新一次降低 GUI 压力
+        if epoch_idx % 5 == 0:
+            self.draw_idle()
+
+    def set_compensated(self, e_arr, n_arr):
+        """绘制补偿后散点"""
+        if len(e_arr) == 0:
+            return
+        pts = np.column_stack([np.asarray(e_arr), np.asarray(n_arr)])
+        self.scatter_comp.set_offsets(pts)
+        self.scatter_comp.set_visible(True)
+        self.draw_idle()
+
+    def reset(self):
+        """清空所有缓冲区"""
+        self.buf_e_solve.clear()
+        self.buf_n_solve.clear()
+        self.buf_e_truth.clear()
+        self.buf_n_truth.clear()
+        self.scatter_solve.set_offsets(np.empty((0, 2)))
+        self.scatter_comp.set_offsets(np.empty((0, 2)))
+        self.scatter_comp.set_visible(False)
+        self.current_point.set_data([], [])
+        self.line_truth.set_data([], [])
+        self.draw_idle()
 # ============================================================
 #  主窗口
 # ============================================================
@@ -330,12 +475,15 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("北斗 SPP 单点定位解算软件 v2.0 — 北京邮电大学")
+        self.setWindowTitle("北斗 SPP 单点定位解算软件 v2.1 — 北京邮电大学")
         self.setMinimumSize(1400, 900)
 
         # 状态变量
         self.nav_path = ''
         self.obs_path = ''
+        self.truth_csv_path = ''
+        self.truth_trajectory_df: Optional[pd.DataFrame] = None
+        self.truth_lookup: dict = {}  # Dict[datetime, ndarray]
         self.worker: Optional[SppWorker] = None
         self.solutions: List[EpochSolution] = []
         self.solutions_compensated: List[EpochSolution] = []
@@ -380,7 +528,30 @@ class MainWindow(QMainWindow):
 
         file_group.setLayout(file_layout)
         left_layout.addWidget(file_group)
+        
+        # === 真值模式组 (新增) ===
+        truth_group = QGroupBox("真值模式")
+        truth_layout = QFormLayout()
 
+        from PyQt5.QtWidgets import QComboBox
+        self.cmb_truth_mode = QComboBox()
+        self.cmb_truth_mode.addItem("静态锚点 (北邮沙河)", "static")
+        self.cmb_truth_mode.addItem("动态轨迹 (CSV)", "trajectory")
+        truth_layout.addRow("真值类型:", self.cmb_truth_mode)
+
+        self.truth_edit = QLineEdit()
+        self.truth_edit.setReadOnly(True)
+        self.truth_edit.setPlaceholderText("(选填) 真值轨迹CSV...")
+        self.btn_truth = QPushButton("浏览")
+        self.btn_truth.setEnabled(False)  # 默认静态模式禁用
+        truth_row = QHBoxLayout()
+        truth_row.addWidget(self.truth_edit)
+        truth_row.addWidget(self.btn_truth)
+        truth_layout.addRow("真值文件:", truth_row)
+
+        truth_group.setLayout(truth_layout)
+        left_layout.addWidget(truth_group)
+            
         # 参数配置组
         param_group = QGroupBox("解算参数")
         param_layout = QFormLayout()
@@ -475,6 +646,9 @@ class MainWindow(QMainWindow):
         self.realtime_canvas = RealtimeCanvas()
         self.tab_widget.addTab(self.realtime_canvas, "实时监控")
 
+        self.trajectory_canvas = TrajectoryCanvas()
+        self.tab_widget.addTab(self.trajectory_canvas, "轨迹监控")
+
         self.result_canvas = FigureCanvas(Figure(figsize=(12, 8)))
         self.tab_widget.addTab(self.result_canvas, "分析结果")
 
@@ -491,7 +665,9 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self._stop_solve)
         self.btn_ai.clicked.connect(self._run_ai_compensation)
         self.btn_export.clicked.connect(self._export_results)
-
+        self.btn_truth.clicked.connect(self._select_truth_csv)
+        self.cmb_truth_mode.currentIndexChanged.connect(self._on_truth_mode_changed)
+        
     def _select_nav(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择导航文件", "data", "NAV Files (*.nav);;All (*)")
@@ -514,7 +690,24 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先选择导航文件和观测文件！")
             return
 
+        truth_mode = self.cmb_truth_mode.currentData()
+        if truth_mode == 'trajectory' and not self.truth_lookup:
+            QMessageBox.warning(self, "提示",
+                                "轨迹模式下请先加载真值轨迹CSV!")
+            return
+
         self.realtime_canvas.reset()
+        # 轨迹画布重置时保留已加载的真值曲线
+        self.trajectory_canvas.buf_e_solve.clear()
+        self.trajectory_canvas.buf_n_solve.clear()
+        self.trajectory_canvas.scatter_solve.set_offsets(np.empty((0, 2)))
+        self.trajectory_canvas.scatter_comp.set_offsets(np.empty((0, 2)))
+        self.trajectory_canvas.scatter_comp.set_visible(False)
+
+        # 静态模式下设置一个原点真值标记
+        if truth_mode == 'static':
+            self.trajectory_canvas.set_truth_curve([0.0], [0.0])
+
         self.solutions.clear()
         self.solutions_compensated.clear()
         self.progress_bar.setValue(0)
@@ -524,13 +717,15 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(False)
 
         self._log("=" * 50)
-        self._log("开始解算...")
+        self._log(f"开始解算 (真值模式: {truth_mode})...")
 
         self.worker = SppWorker(
             nav_path=self.nav_path,
             obs_path=self.obs_path,
             elev_mask=self.spin_elev.value(),
             max_iter=self.spin_iter.value(),
+            truth_mode=truth_mode,
+            truth_lookup=self.truth_lookup,
         )
 
         self.worker.progress_signal.connect(self._on_progress)
@@ -567,6 +762,13 @@ class MainWindow(QMainWindow):
 
             self.realtime_canvas.update_enu(idx, e, n, u)
             self.realtime_canvas.update_skyplot(sig['skyplot'])
+
+            # 轨迹画布: 解算点 ENU (相对锚点)
+            sol_e, sol_n, _ = sig['sol_enu_anchor']
+            gt_e, gt_n, _ = sig['gt_enu_anchor']
+            self.trajectory_canvas.update_point(
+                idx, sol_e, sol_n, gt_e, gt_n
+            )
         else:
             self.lbl_pos.setText("无效解")
             self.lbl_enu.setText("—")
@@ -600,11 +802,16 @@ class MainWindow(QMainWindow):
     def _render_result_tab(self):
         """渲染分析结果 Tab"""
         if not self.solutions:
-            self._log("警告: 无解算结果")
             return
 
-        analyzer = TrajectoryAnalyzer(self.solutions, output_dir='data',
-                                       scene_label='SPP解算')
+        truth_mode = self.cmb_truth_mode.currentData()
+
+        analyzer = TrajectoryAnalyzer(
+            self.solutions, output_dir='data',
+            scene_label='SPP解算',
+            truth_mode=truth_mode,
+            truth_trajectory=self.truth_trajectory_df,
+        )
         analyzer.compute_errors()
 
         if analyzer.df is None or len(analyzer.df) == 0:
@@ -622,17 +829,22 @@ class MainWindow(QMainWindow):
         df = analyzer.df
 
         # ENU 时序
-        ax1.plot(df['epoch'], df['err_e'], label='E', color='#d62728', linewidth=0.6, alpha=0.7)
-        ax1.plot(df['epoch'], df['err_n'], label='N', color='#2ca02c', linewidth=0.6, alpha=0.7)
-        ax1.plot(df['epoch'], df['err_u'], label='U', color='#1f77b4', linewidth=0.6, alpha=0.7)
+        ax1.plot(df['epoch'], df['err_e'], label='E', color='#d62728',
+                 linewidth=0.6, alpha=0.7)
+        ax1.plot(df['epoch'], df['err_n'], label='N', color='#2ca02c',
+                 linewidth=0.6, alpha=0.7)
+        ax1.plot(df['epoch'], df['err_u'], label='U', color='#1f77b4',
+                 linewidth=0.6, alpha=0.7)
         ax1.axhline(0, color='black', linestyle='--', linewidth=0.5, alpha=0.4)
         ax1.set_ylabel('误差 (m)', fontsize=9)
-        ax1.set_title('ENU 误差时序', fontsize=10, fontweight='bold')
+        title_suffix = f" (真值模式: {truth_mode})"
+        ax1.set_title(f'ENU 误差时序{title_suffix}',
+                      fontsize=10, fontweight='bold')
         ax1.legend(loc='upper right', fontsize=8)
         ax1.grid(True, alpha=0.3)
         ax1.tick_params(labelsize=8)
 
-        # 水平散点
+        # 水平散点 (CEP)
         e = df['err_e'].values
         n = df['err_n'].values
         r = np.sqrt(e ** 2 + n ** 2)
@@ -640,13 +852,13 @@ class MainWindow(QMainWindow):
 
         ax2.scatter(e, n, c='#1f77b4', s=5, alpha=0.5)
         circle = Circle((0, 0), cep95, fill=False, color='red',
-                       linewidth=2, linestyle='--',
-                       label=f'95% CEP={cep95:.2f}m')
+                        linewidth=2, linestyle='--',
+                        label=f'95% CEP={cep95:.2f}m')
         ax2.add_patch(circle)
         ax2.axhline(0, color='gray', linewidth=0.5)
         ax2.axvline(0, color='gray', linewidth=0.5)
-        ax2.set_xlabel('East (m)', fontsize=9)
-        ax2.set_ylabel('North (m)', fontsize=9)
+        ax2.set_xlabel('East 误差 (m)', fontsize=9)
+        ax2.set_ylabel('North 误差 (m)', fontsize=9)
         ax2.set_title('水平误差散点', fontsize=10, fontweight='bold')
         ax2.legend(loc='upper left', fontsize=8)
         ax2.grid(True, alpha=0.3)
@@ -668,9 +880,10 @@ class MainWindow(QMainWindow):
             pass
         self.result_canvas.draw()
 
-        self._log(f"分析完成: RMS_3D={report.get('rms_3d', 0):.3f}m, "
+        self._log(f"分析完成: 模式={truth_mode}, "
+                  f"RMS_3D={report.get('rms_3d', 0):.3f}m, "
                   f"95%CEP={report.get('cep_95', 0):.3f}m")
-
+        
     def _run_ai_compensation(self):
         """执行 AI 误差补偿"""
         if not self.solutions:
@@ -684,7 +897,10 @@ class MainWindow(QMainWindow):
             compensator = AiCompensator()
 
             X = compensator.extract_features(self.solutions)
-            Y = compensator.extract_labels(self.solutions)
+            Y = compensator.extract_labels(
+                self.solutions,
+                truth_lookup=self.truth_lookup if self.truth_lookup else None,
+            )
 
             if len(X) < 10:
                 QMessageBox.warning(self, "提示", "有效历元数不足，无法训练模型！")
@@ -707,7 +923,15 @@ class MainWindow(QMainWindow):
             self._log(f"模型已保存: {model_path}")
 
             self._render_ai_tab(compensator)
-
+            # === 在轨迹监控画布叠加补偿后散点 ===
+            comp_e, comp_n = [], []
+            for sc in self.solutions_compensated:
+                if sc.valid:
+                    enu = R_ENU @ (sc.pos_ecef - GT_ECEF)
+                    comp_e.append(enu[0])
+                    comp_n.append(enu[1])
+            if comp_e:
+                self.trajectory_canvas.set_compensated(comp_e, comp_n)
             self._log("AI 补偿完成!")
             self.statusBar().showMessage("AI 补偿完成")
 
@@ -820,12 +1044,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先完成解算！")
             return
 
+        truth_mode = self.cmb_truth_mode.currentData()
         self._log("=" * 50)
-        self._log("正在导出报告与图表...")
+        self._log(f"正在导出报告与图表 (真值模式: {truth_mode})...")
 
         try:
-            analyzer = TrajectoryAnalyzer(self.solutions, output_dir='data',
-                                           scene_label='SPP解算')
+            analyzer = TrajectoryAnalyzer(
+                self.solutions, output_dir='data',
+                scene_label='SPP解算',
+                truth_mode=truth_mode,
+                truth_trajectory=self.truth_trajectory_df,
+            )
             analyzer.compute_errors()
             report = analyzer.generate_report()
 
@@ -839,19 +1068,28 @@ class MainWindow(QMainWindow):
                 )
                 paths.extend(comp_paths)
 
+                # 轨迹模式下追加轨迹+补偿对比图
+                if truth_mode == 'trajectory':
+                    p = analyzer.plot_trajectory_vs_truth(
+                        tag='AI补偿_轨迹',
+                        solutions_compensated=self.solutions_compensated,
+                    )
+                    if p:
+                        paths.append(p)
+
             self._log(f"导出完成! 共生成 {len(paths)} 张图表")
             for p in paths:
                 self._log(f"  - {p}")
 
             QMessageBox.information(self, "导出成功",
-                                    f"报告与图表已保存至 data/ 目录\n共 {len(paths)} 张图表")
-
-        except Exception as exc:
+                                    f"报告与图表已保存至 data/ 目录\n"
+                                    f"共 {len(paths)} 张图表")
+        except Exception:
             import traceback
             err_msg = traceback.format_exc()
             self._log(f"导出异常:\n{err_msg}")
             QMessageBox.critical(self, "导出异常", err_msg[:500])
-
+            
     def _log(self, msg: str):
         """追加日志"""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -859,7 +1097,65 @@ class MainWindow(QMainWindow):
         self.log_text.verticalScrollBar().setValue(
             self.log_text.verticalScrollBar().maximum()
         )
+    def _on_truth_mode_changed(self, idx):
+        """真值模式切换"""
+        mode = self.cmb_truth_mode.currentData()
+        is_traj = (mode == 'trajectory')
+        self.btn_truth.setEnabled(is_traj)
+        if not is_traj:
+            self.truth_csv_path = ''
+            self.truth_edit.setText('')
+            self.truth_trajectory_df = None
+            self.truth_lookup = {}
+            self.trajectory_canvas.set_truth_curve([], [])
+        self._log(f"真值模式切换为: {self.cmb_truth_mode.currentText()}")
 
+    def _select_truth_csv(self):
+        """加载真值轨迹CSV"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择真值轨迹CSV", "data",
+            "CSV Files (*.csv);;All (*)")
+        if not path:
+            return
+
+        try:
+            from trajectory_analyzer import load_truth_trajectory_csv
+            df = load_truth_trajectory_csv(path)
+            self.truth_csv_path = path
+            self.truth_edit.setText(os.path.basename(path))
+            self.truth_trajectory_df = df
+
+            # 构建 lookup
+            self.truth_lookup = {}
+            for _, row in df.iterrows():
+                ep = row['epoch']
+                if hasattr(ep, 'to_pydatetime'):
+                    ep = ep.to_pydatetime()
+                self.truth_lookup[ep] = np.array(
+                    [row['gt_x'], row['gt_y'], row['gt_z']],
+                    dtype=np.float64
+                )
+
+            # 在轨迹画布上预绘制真值曲线 (使用 gt_e/gt_n, 若无则现算)
+            if 'gt_e' in df.columns and 'gt_n' in df.columns:
+                e_arr = df['gt_e'].values
+                n_arr = df['gt_n'].values
+            else:
+                gt_xyz = df[['gt_x', 'gt_y', 'gt_z']].values
+                gt_dx = gt_xyz - GT_ECEF[np.newaxis, :]
+                gt_enu = (R_ENU @ gt_dx.T).T
+                e_arr = gt_enu[:, 0]
+                n_arr = gt_enu[:, 1]
+
+            self.trajectory_canvas.set_truth_curve(e_arr, n_arr)
+            # 自动切换到轨迹监控 Tab
+            self.tab_widget.setCurrentWidget(self.trajectory_canvas)
+
+            self._log(f"已加载真值轨迹: {path}, {len(df)} 个历元")
+
+        except Exception as exc:
+            QMessageBox.critical(self, "加载失败", str(exc))
+            self._log(f"真值CSV加载失败: {exc}")
 
 # ============================================================
 #  主程序入口
