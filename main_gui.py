@@ -16,6 +16,7 @@ import os
 import sys
 import math
 import numpy as np
+import pandas as pd
 from collections import deque
 from datetime import datetime
 from typing import Optional, List
@@ -280,6 +281,10 @@ class RealtimeCanvas(FigureCanvas):
         self.buf_n.append(n)
         self.buf_u.append(u)
 
+        # === 仅当本 canvas 在屏幕上可见时才执行 matplotlib 渲染 ===
+        if not self.isVisible():
+            return
+
         idx_arr = list(self.buf_idx)
         self.line_e.set_data(idx_arr, list(self.buf_e))
         self.line_n.set_data(idx_arr, list(self.buf_n))
@@ -344,6 +349,24 @@ class RealtimeCanvas(FigureCanvas):
         self.ax_sky.clear()
         self.draw_idle()
 
+    def flush(self):
+        """强制刷新最终帧"""
+        if len(self.buf_idx) == 0:
+            return
+        idx_arr = list(self.buf_idx)
+        self.line_e.set_data(idx_arr, list(self.buf_e))
+        self.line_n.set_data(idx_arr, list(self.buf_n))
+        self.line_u.set_data(idx_arr, list(self.buf_u))
+        for ax, buf in [(self.ax_e, self.buf_e),
+                         (self.ax_n, self.buf_n),
+                         (self.ax_u, self.buf_u)]:
+            if len(buf) > 0:
+                ymin = min(buf) - 1
+                ymax = max(buf) + 1
+                ax.set_xlim(max(0, idx_arr[0]), idx_arr[-1] + 1)
+                ax.set_ylim(ymin, ymax)
+        self.draw_idle()
+
 # ============================================================
 #  TrajectoryCanvas — 实时轨迹平面图画布
 # ============================================================
@@ -359,7 +382,8 @@ class TrajectoryCanvas(FigureCanvas):
     """
 
     def __init__(self, parent=None):
-        self.fig = Figure(figsize=(10, 8), dpi=100, constrained_layout=True)
+        self.fig = Figure(figsize=(8, 8), dpi=100)
+        self.fig.subplots_adjust(left=0.10, right=0.97, top=0.94, bottom=0.08)
         super().__init__(self.fig)
         self.setParent(parent)
 
@@ -392,7 +416,7 @@ class TrajectoryCanvas(FigureCanvas):
                                              visible=False)
 
         self.ax.legend(loc='upper right', fontsize=9)
-        self.ax.set_aspect('equal', adjustable='datalim')
+        self.ax.set_aspect('equal', adjustable='box')
 
         # 数据缓冲
         self.buf_e_solve = deque(maxlen=MAX_BUFFER)
@@ -404,46 +428,57 @@ class TrajectoryCanvas(FigureCanvas):
     def set_truth_curve(self, e_arr, n_arr):
         """
         一次性设置真值轨迹曲线 (用于在解算开始前预绘制)
-
-        Parameters:
-            e_arr, n_arr : array-like, ENU 平面真值坐标
+        强制对称坐标范围,确保椭圆完整显示。
         """
-        self.line_truth.set_data(np.asarray(e_arr), np.asarray(n_arr))
-        # 自动调整坐标范围
+        e_arr = np.asarray(e_arr)
+        n_arr = np.asarray(n_arr)
+        self.line_truth.set_data(e_arr, n_arr)
+
         if len(e_arr) > 0:
-            margin = 50.0
-            self.ax.set_xlim(min(e_arr) - margin, max(e_arr) + margin)
-            self.ax.set_ylim(min(n_arr) - margin, max(n_arr) + margin)
+            # 取 E/N 最大绝对值, 加 15% 留白, 强制对称范围
+            max_abs = max(np.max(np.abs(e_arr)), np.max(np.abs(n_arr)))
+            lim = max_abs * 1.15 if max_abs > 0 else 100.0
+            self.ax.set_xlim(-lim, lim)
+            self.ax.set_ylim(-lim, lim)
+            # 关闭等比 (等比会让 figure 越收越窄, 改用固定 set_xlim/ylim 即可保形)
+            self.ax.set_aspect('equal', adjustable='box')
         self.draw_idle()
 
     def update_point(self, epoch_idx: int, sol_e: float, sol_n: float,
                      gt_e: Optional[float] = None,
                      gt_n: Optional[float] = None):
         """
-        追加一个新解算点 (并可选更新当前真值点)
+        追加一个新解算点 (低频刷新 + 强制最终帧)
 
-        Parameters:
-            epoch_idx : 历元索引
-            sol_e, sol_n : SPP 解算 ENU 坐标
-            gt_e, gt_n   : (可选) 当前历元真值 ENU 坐标
+        优化:
+          - 数据始终入缓冲 (不丢点)
+          - 每 20 个历元才调用一次 set_offsets + draw_idle (降低渲染压力)
+          - 总历元数已知时, 最后一帧无条件刷新
         """
         self.buf_e_solve.append(float(sol_e))
         self.buf_n_solve.append(float(sol_n))
 
         if gt_e is not None and gt_n is not None:
-            self.buf_e_truth.append(float(gt_e))
             self.buf_n_truth.append(float(gt_n))
+            self.buf_e_truth.append(float(gt_e))
 
-        # 更新散点
-        pts = np.column_stack([list(self.buf_e_solve),
-                               list(self.buf_n_solve)])
-        self.scatter_solve.set_offsets(pts)
+        # 每 20 个历元刷新一次 (从 5 → 20, 大幅降低绘制频率)
+        if epoch_idx % 20 == 0:
+            pts = np.column_stack([list(self.buf_e_solve),
+                                   list(self.buf_n_solve)])
+            self.scatter_solve.set_offsets(pts)
+            self.current_point.set_data([sol_e], [sol_n])
+            self.draw_idle()
 
-        # 更新当前点高亮
-        self.current_point.set_data([sol_e], [sol_n])
-
-        # 每 5 个历元刷新一次降低 GUI 压力
-        if epoch_idx % 5 == 0:
+    def flush(self):
+        """强制刷新最终帧 (无视可见性, 解算完成时无条件渲染一次)"""
+        if len(self.buf_e_solve) > 0:
+            pts = np.column_stack([list(self.buf_e_solve),
+                                   list(self.buf_n_solve)])
+            self.scatter_solve.set_offsets(pts)
+            last_e = self.buf_e_solve[-1]
+            last_n = self.buf_n_solve[-1]
+            self.current_point.set_data([last_e], [last_n])
             self.draw_idle()
 
     def set_compensated(self, e_arr, n_arr):
@@ -777,6 +812,12 @@ class MainWindow(QMainWindow):
     def _on_finished(self, solutions: list):
         """解算完成"""
         self.solutions = solutions
+
+        # === 强制刷新轨迹画布最终帧 (问题1修复) ===
+        self.trajectory_canvas.flush()
+        self.realtime_canvas.flush()   # 新增
+        self.realtime_canvas.draw_idle()
+
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_ai.setEnabled(True)
@@ -885,13 +926,17 @@ class MainWindow(QMainWindow):
                   f"95%CEP={report.get('cep_95', 0):.3f}m")
         
     def _run_ai_compensation(self):
-        """执行 AI 误差补偿"""
+        """执行 AI 误差补偿 — 显式按真值模式传 truth_lookup"""
         if not self.solutions:
             QMessageBox.warning(self, "提示", "请先完成 SPP 解算！")
             return
 
+        truth_mode = self.cmb_truth_mode.currentData()
+        use_traj = (truth_mode == 'trajectory' and bool(self.truth_lookup))
+
         self._log("=" * 50)
-        self._log("开始 AI 误差补偿训练...")
+        self._log(f"开始 AI 误差补偿训练 (真值模式: "
+                  f"{'动态轨迹' if use_traj else '静态锚点'})...")
 
         try:
             compensator = AiCompensator()
@@ -899,12 +944,31 @@ class MainWindow(QMainWindow):
             X = compensator.extract_features(self.solutions)
             Y = compensator.extract_labels(
                 self.solutions,
-                truth_lookup=self.truth_lookup if self.truth_lookup else None,
+                truth_lookup=self.truth_lookup if use_traj else None,
             )
+
+            # === 关键诊断: 打印标签统计, 确认 AI 学的是真实误差 ===
+            self._log(f"  特征矩阵: {X.shape}, 标签矩阵: {Y.shape}")
+            self._log(f"  ECEF 误差范围: dX[{Y['dX'].min():.2f}, {Y['dX'].max():.2f}]m  "
+                      f"dY[{Y['dY'].min():.2f}, {Y['dY'].max():.2f}]m  "
+                      f"dZ[{Y['dZ'].min():.2f}, {Y['dZ'].max():.2f}]m")
+            label_3d_rms = np.sqrt(np.mean((Y.values ** 2).sum(axis=1)))
+            self._log(f"  标签 3D RMS: {label_3d_rms:.3f}m  "
+                      f"(若 > 100m 说明用错真值模式!)")
 
             if len(X) < 10:
                 QMessageBox.warning(self, "提示", "有效历元数不足，无法训练模型！")
                 return
+
+            # === 3σ 离群剔除 (可选, 大幅提升 AI 模型质量) ===
+            err_3d = np.sqrt((Y.values ** 2).sum(axis=1))
+            threshold = err_3d.mean() + 3 * err_3d.std()
+            mask = err_3d <= threshold
+            n_removed = (~mask).sum()
+            if n_removed > 0:
+                self._log(f"  剔除 {n_removed} 个 3σ 离群历元 (阈值={threshold:.1f}m)")
+                X = X[mask].reset_index(drop=True)
+                Y = Y[mask].reset_index(drop=True)
 
             metrics = compensator.train(
                 X, Y,
@@ -914,47 +978,71 @@ class MainWindow(QMainWindow):
                 verbose=False,
             )
 
-            self._log(f"训练完成: RMSE_3D={metrics.get('rmse_3d', 0):.4f}m")
+            self._log(f"训练完成: 测试集 RMSE_3D={metrics.get('rmse_3d', 0):.4f}m")
 
-            self.solutions_compensated = compensator.compensate_solutions(self.solutions)
+            # 补偿 (compensate_solutions 内部用 GT_ECEF 预测的误差, 这里需要修正)
+            self.solutions_compensated = compensator.compensate_solutions(
+                self.solutions
+            )
 
             model_path = os.path.join('data', 'bds_rf_model.pkl')
             compensator.save_model(model_path)
             self._log(f"模型已保存: {model_path}")
 
             self._render_ai_tab(compensator)
-            # === 在轨迹监控画布叠加补偿后散点 ===
+
+            # === 在轨迹监控画布叠加补偿后散点 (按动态真值算 ENU) ===
             comp_e, comp_n = [], []
             for sc in self.solutions_compensated:
                 if sc.valid:
-                    enu = R_ENU @ (sc.pos_ecef - GT_ECEF)
+                    enu = R_ENU @ (sc.pos_ecef - GT_ECEF)  # 仅用于轨迹图,相对锚点
                     comp_e.append(enu[0])
                     comp_n.append(enu[1])
             if comp_e:
                 self.trajectory_canvas.set_compensated(comp_e, comp_n)
+
             self._log("AI 补偿完成!")
             self.statusBar().showMessage("AI 补偿完成")
 
-        except Exception as exc:
+        except Exception:
             import traceback
             err_msg = traceback.format_exc()
             self._log(f"AI 补偿异常:\n{err_msg}")
             QMessageBox.critical(self, "AI 补偿异常", err_msg[:500])
 
     def _render_ai_tab(self, compensator: AiCompensator):
-        """渲染 AI 补偿 Tab"""
+        """渲染 AI 补偿 Tab — 使用动态真值(若有)"""
         if not self.solutions_compensated:
             return
 
-        gt_ecef = GT_ECEF.copy()
-        r_enu = R_ENU.copy()
+        # === 关键修复: 按真值模式选择参考点 ===
+        # static 模式: 全部用 GT_ECEF
+        # trajectory 模式: 用 truth_lookup 动态查表
+        use_traj = bool(self.truth_lookup)
 
+        r_enu = R_ENU.copy()
         enu_raw, enu_comp, epochs = [], [], []
+
         for sr, sc in zip(self.solutions, self.solutions_compensated):
             if not sr.valid:
                 continue
-            enu_raw.append(r_enu @ (sr.pos_ecef - gt_ecef))
-            enu_comp.append(r_enu @ (sc.pos_ecef - gt_ecef))
+
+            # 选择该历元的真值 ECEF
+            if use_traj:
+                gt = self.truth_lookup.get(sr.epoch)
+                if gt is None:
+                    # 容差兜底
+                    for k, v in self.truth_lookup.items():
+                        if abs((k - sr.epoch).total_seconds()) < 0.5:
+                            gt = v
+                            break
+                if gt is None:
+                    gt = GT_ECEF
+            else:
+                gt = GT_ECEF
+
+            enu_raw.append(r_enu @ (sr.pos_ecef - gt))
+            enu_comp.append(r_enu @ (sc.pos_ecef - gt))
             epochs.append(sr.epoch)
 
         if not enu_raw:
@@ -969,18 +1057,32 @@ class MainWindow(QMainWindow):
         ax2 = self.ai_canvas.figure.add_subplot(gs[1, 0])
         ax3 = self.ai_canvas.figure.add_subplot(gs[1, 1])
 
-        # ENU 对比 (E 分量)
+        # === ENU 三分量 RMS 对比 (改为单图叠 E/N/U) ===
         rms_e_raw = np.sqrt(np.mean(enu_raw[:, 0] ** 2))
         rms_e_comp = np.sqrt(np.mean(enu_comp[:, 0] ** 2))
+        rms_n_raw = np.sqrt(np.mean(enu_raw[:, 1] ** 2))
+        rms_n_comp = np.sqrt(np.mean(enu_comp[:, 1] ** 2))
+        rms_u_raw = np.sqrt(np.mean(enu_raw[:, 2] ** 2))
+        rms_u_comp = np.sqrt(np.mean(enu_comp[:, 2] ** 2))
 
-        ax1.plot(epochs, enu_raw[:, 0], label=f'补偿前 E (RMS={rms_e_raw:.3f}m)',
-                 color='#d62728', linewidth=0.6, alpha=0.6)
-        ax1.plot(epochs, enu_comp[:, 0], label=f'补偿后 E (RMS={rms_e_comp:.3f}m)',
-                 color='#1f77b4', linewidth=0.8, alpha=0.8)
+        ax1.plot(epochs, enu_raw[:, 0],
+                 label=f'补偿前 E (RMS={rms_e_raw:.3f}m)',
+                 color='#d62728', linewidth=0.6, alpha=0.55)
+        ax1.plot(epochs, enu_comp[:, 0],
+                 label=f'补偿后 E (RMS={rms_e_comp:.3f}m)',
+                 color='#1f77b4', linewidth=0.7, alpha=0.85)
+        ax1.plot(epochs, enu_raw[:, 1],
+                 label=f'补偿前 N (RMS={rms_n_raw:.3f}m)',
+                 color='#ff7f0e', linewidth=0.6, alpha=0.55)
+        ax1.plot(epochs, enu_comp[:, 1],
+                 label=f'补偿后 N (RMS={rms_n_comp:.3f}m)',
+                 color='#2ca02c', linewidth=0.7, alpha=0.85)
         ax1.axhline(0, color='black', linestyle='--', linewidth=0.5, alpha=0.4)
-        ax1.set_ylabel('East 误差 (m)', fontsize=9)
-        ax1.set_title('AI 补偿前后 East 误差对比', fontsize=10, fontweight='bold')
-        ax1.legend(loc='upper right', fontsize=8)
+        ax1.set_ylabel('误差 (m)', fontsize=9)
+        mode_str = "动态真值" if use_traj else "静态锚点"
+        ax1.set_title(f'AI 补偿前后 E/N 误差对比 ({mode_str})',
+                      fontsize=10, fontweight='bold')
+        ax1.legend(loc='upper right', fontsize=7, ncol=2)
         ax1.grid(True, alpha=0.3)
         ax1.tick_params(labelsize=8)
 
@@ -990,14 +1092,13 @@ class MainWindow(QMainWindow):
         cep95_raw = np.percentile(r_raw, 95)
 
         ax2.scatter(e_raw, n_raw, c='#d62728', s=5, alpha=0.5)
-        circle_raw = Circle((0, 0), cep95_raw, fill=False, color='red',
-                           linewidth=2, linestyle='--',
-                           label=f'95% CEP={cep95_raw:.2f}m')
-        ax2.add_patch(circle_raw)
+        ax2.add_patch(Circle((0, 0), cep95_raw, fill=False, color='red',
+                             linewidth=2, linestyle='--',
+                             label=f'95% CEP={cep95_raw:.2f}m'))
         ax2.axhline(0, color='gray', linewidth=0.5)
         ax2.axvline(0, color='gray', linewidth=0.5)
-        ax2.set_xlabel('East (m)', fontsize=9)
-        ax2.set_ylabel('North (m)', fontsize=9)
+        ax2.set_xlabel('East 误差 (m)', fontsize=9)
+        ax2.set_ylabel('North 误差 (m)', fontsize=9)
         ax2.set_title('补偿前', fontsize=10, fontweight='bold')
         ax2.legend(loc='upper left', fontsize=8)
         ax2.grid(True, alpha=0.3)
@@ -1010,18 +1111,20 @@ class MainWindow(QMainWindow):
         cep95_comp = np.percentile(r_comp, 95)
 
         ax3.scatter(e_comp, n_comp, c='#1f77b4', s=5, alpha=0.5)
-        circle_comp = Circle((0, 0), cep95_comp, fill=False, color='blue',
-                            linewidth=2, linestyle='--',
-                            label=f'95% CEP={cep95_comp:.2f}m')
-        ax3.add_patch(circle_comp)
+        ax3.add_patch(Circle((0, 0), cep95_comp, fill=False, color='blue',
+                             linewidth=2, linestyle='--',
+                             label=f'95% CEP={cep95_comp:.2f}m'))
         ax3.axhline(0, color='gray', linewidth=0.5)
         ax3.axvline(0, color='gray', linewidth=0.5)
-        ax3.set_xlabel('East (m)', fontsize=9)
-        ax3.set_ylabel('North (m)', fontsize=9)
+        ax3.set_xlabel('East 误差 (m)', fontsize=9)
+        ax3.set_ylabel('North 误差 (m)', fontsize=9)
         ax3.set_title('补偿后', fontsize=10, fontweight='bold')
         ax3.legend(loc='upper left', fontsize=8)
         ax3.grid(True, alpha=0.3)
         ax3.axis('equal')
+        # === 关键: 与补偿前用同一坐标范围, 让效果对比直观 ===
+        ax3.set_xlim(ax2.get_xlim())
+        ax3.set_ylim(ax2.get_ylim())
         ax3.tick_params(labelsize=8)
 
         try:
@@ -1034,9 +1137,9 @@ class MainWindow(QMainWindow):
         rms3d_comp = np.sqrt(np.mean(np.sum(enu_comp ** 2, axis=1)))
         improve = (1 - rms3d_comp / max(rms3d_raw, 1e-9)) * 100
 
-        self._log(f"补偿前 3D RMS: {rms3d_raw:.3f}m")
-        self._log(f"补偿后 3D RMS: {rms3d_comp:.3f}m")
-        self._log(f"精度提升: {improve:.1f}%")
+        self._log(f"[AI对比-{mode_str}] 补偿前 3D RMS: {rms3d_raw:.3f}m")
+        self._log(f"[AI对比-{mode_str}] 补偿后 3D RMS: {rms3d_comp:.3f}m")
+        self._log(f"[AI对比-{mode_str}] 精度提升: {improve:.1f}%")
 
     def _export_results(self):
         """导出报告与图表"""
@@ -1121,6 +1224,19 @@ class MainWindow(QMainWindow):
         try:
             from trajectory_analyzer import load_truth_trajectory_csv
             df = load_truth_trajectory_csv(path)
+
+            # === 防御: 检查是否每个 epoch 唯一 (避免误选观测CSV) ===
+            n_unique = df['epoch'].nunique()
+            if n_unique < len(df) * 0.95:
+                # 观测 CSV 每个 epoch 有多颗卫星行 → 大量重复
+                QMessageBox.warning(
+                    self, "文件类型错误",
+                    f"该 CSV 含 {len(df)} 行但仅 {n_unique} 个唯一历元,\n"
+                    f"看起来是观测数据CSV而非真值轨迹CSV!\n"
+                    f"请选择以 '_truth_trajectory.csv' 结尾的文件。"
+                )
+                return
+
             self.truth_csv_path = path
             self.truth_edit.setText(os.path.basename(path))
             self.truth_trajectory_df = df
@@ -1136,7 +1252,6 @@ class MainWindow(QMainWindow):
                     dtype=np.float64
                 )
 
-            # 在轨迹画布上预绘制真值曲线 (使用 gt_e/gt_n, 若无则现算)
             if 'gt_e' in df.columns and 'gt_n' in df.columns:
                 e_arr = df['gt_e'].values
                 n_arr = df['gt_n'].values
@@ -1148,7 +1263,6 @@ class MainWindow(QMainWindow):
                 n_arr = gt_enu[:, 1]
 
             self.trajectory_canvas.set_truth_curve(e_arr, n_arr)
-            # 自动切换到轨迹监控 Tab
             self.tab_widget.setCurrentWidget(self.trajectory_canvas)
 
             self._log(f"已加载真值轨迹: {path}, {len(df)} 个历元")

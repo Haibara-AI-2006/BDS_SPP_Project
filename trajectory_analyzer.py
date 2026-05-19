@@ -680,6 +680,9 @@ class TrajectoryAnalyzer:
     # ================================================================
     #  AI 补偿前后对比图 (对接 ai_compensator)
     # ================================================================
+    # ================================================================
+    #  AI 补偿前后对比图 (对接 ai_compensator) — 支持动态真值
+    # ================================================================
     def plot_compensation_comparison(
         self,
         solutions_raw: List,
@@ -689,18 +692,21 @@ class TrajectoryAnalyzer:
         """
         绘制 AI 补偿前后的 ENU 精度对比
 
-        Returns:
-            图片路径列表
+        - static 模式: 真值 = GT_ECEF
+        - trajectory 模式: 真值 = self._truth_lookup[epoch] (动态)
         """
         paths = []
 
-        # 提取有效历元 ENU
+        # 用与 compute_errors 一致的真值选择逻辑
         enu_raw, enu_comp, epochs = [], [], []
         for sr, sc in zip(solutions_raw, solutions_comp):
             if not sr.valid:
                 continue
-            enu_raw.append(R_ENU @ (sr.pos_ecef - GT_ECEF))
-            enu_comp.append(R_ENU @ (sc.pos_ecef - GT_ECEF))
+            gt = self._get_gt_ecef(sr.epoch)
+            if gt is None:
+                continue
+            enu_raw.append(R_ENU @ (sr.pos_ecef - gt))
+            enu_comp.append(R_ENU @ (sc.pos_ecef - gt))
             epochs.append(sr.epoch)
 
         if not enu_raw:
@@ -709,9 +715,12 @@ class TrajectoryAnalyzer:
         enu_raw = np.array(enu_raw)
         enu_comp = np.array(enu_comp)
 
+        mode_str = "动态真值" if self.truth_mode == 'trajectory' else "静态锚点"
+
         # --- 图A: ENU 分量对比 ---
         fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-        fig.suptitle(f'AI 补偿前后 ENU 误差对比 — {tag}', fontsize=14, fontweight='bold')
+        fig.suptitle(f'AI 补偿前后 ENU 误差对比 — {tag} ({mode_str})',
+                     fontsize=14, fontweight='bold')
 
         labels = ['East (m)', 'North (m)', 'Up (m)']
         for i, ax in enumerate(axes):
@@ -735,9 +744,17 @@ class TrajectoryAnalyzer:
         plt.close(fig)
         paths.append(p)
 
-        # --- 图B: 水平散点对比 + CEP ---
+        # --- 图B: 水平散点对比 + CEP (统一坐标范围) ---
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        fig.suptitle(f'水平误差散点对比 — {tag}', fontsize=14, fontweight='bold')
+        fig.suptitle(f'水平误差散点对比 — {tag} ({mode_str})',
+                     fontsize=14, fontweight='bold')
+
+        # 先计算统一坐标范围
+        all_e = np.concatenate([enu_raw[:, 0], enu_comp[:, 0]])
+        all_n = np.concatenate([enu_raw[:, 1], enu_comp[:, 1]])
+        em = max(abs(all_e.min()), abs(all_e.max())) * 1.1
+        nm = max(abs(all_n.min()), abs(all_n.max())) * 1.1
+        lim = max(em, nm)
 
         for idx, (enu, title, color, ccolor) in enumerate([
             (enu_raw, '补偿前', '#d62728', 'red'),
@@ -763,17 +780,19 @@ class TrajectoryAnalyzer:
             ax.set_title(title, fontsize=12)
             ax.legend(loc='upper left', fontsize=9)
             ax.grid(True, alpha=0.3)
-            ax.axis('equal')
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_aspect('equal')
 
         plt.tight_layout()
         p = os.path.join(self.output_dir, f'{tag}_comp_scatter.png')
         fig.savefig(p, dpi=150)
         plt.close(fig)
         paths.append(p)
-        # --- 统计汇总 ---
+
         rms3d_raw = np.sqrt(np.mean(np.sum(enu_raw ** 2, axis=1)))
         rms3d_comp = np.sqrt(np.mean(np.sum(enu_comp ** 2, axis=1)))
-        print(f"\n[Analyzer] {tag} 补偿效果:")
+        print(f"\n[Analyzer] {tag} 补偿效果 ({mode_str}):")
         print(f"  补偿前 3D RMS: {rms3d_raw:.3f} m")
         print(f"  补偿后 3D RMS: {rms3d_comp:.3f} m")
         print(f"  精度提升: {(1 - rms3d_comp / max(rms3d_raw, 1e-9)) * 100:.1f}%\n")
