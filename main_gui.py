@@ -961,11 +961,11 @@ class MainWindow(QMainWindow):
                 return
 
             # === 3σ 离群剔除 (可选, 大幅提升 AI 模型质量) ===
-            err_3d = np.sqrt((Y.values ** 2).sum(axis=1))
-            threshold = err_3d.mean() + 3 * err_3d.std()
-            mask = err_3d <= threshold
-            n_removed = (~mask).sum()
-            if n_removed > 0:
+            #err_3d = np.sqrt((Y.values ** 2).sum(axis=1))
+            #threshold = err_3d.mean() + 3 * err_3d.std()
+            #mask = err_3d <= threshold
+            #n_removed = (~mask).sum()
+            #if n_removed > 0:
                 self._log(f"  剔除 {n_removed} 个 3σ 离群历元 (阈值={threshold:.1f}m)")
                 X = X[mask].reset_index(drop=True)
                 Y = Y[mask].reset_index(drop=True)
